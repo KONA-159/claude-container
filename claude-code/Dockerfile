@@ -5,7 +5,8 @@ FROM node:22-alpine
 RUN apk add --no-cache git su-exec bash
 
 # Install Claude Code globally
-RUN npm install -g @anthropic-ai/claude-code@~2.1.0
+ARG CLAUDE_CODE_VERSION=latest
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # Create directories
 RUN mkdir -p /claude /workspace
