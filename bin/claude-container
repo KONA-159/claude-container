@@ -446,6 +446,12 @@ fi
 WORKSPACE_DIR="$(cd "$WORKSPACE_DIR" && pwd)"
 CONFIG_DIR="$(cd "$CONFIG_DIR" && pwd)" 2>/dev/null || CONFIG_DIR="$(mkdir -p "$CONFIG_DIR" && cd "$CONFIG_DIR" && pwd)"
 
+# Give each host workspace a stable container-side path. Claude Code stores
+# project state by absolute path, so mounting every project as /workspace mixes
+# resume history, trust state, and allowed tools across unrelated projects.
+WORKSPACE_BASENAME="$(basename "$WORKSPACE_DIR")"
+CONTAINER_WORKSPACE_DIR="/workspaces/${WORKSPACE_BASENAME}"
+
 # Handle proxy mode
 if [ "$USE_PROXY" = true ]; then
     # Convert proxy data dir to absolute path
@@ -499,14 +505,23 @@ else
     echo -e "${GREEN}Starting Claude Container...${NC}"
     echo -e "Version:   ${YELLOW}$VERSION${NC}"
     echo -e "Workspace: ${YELLOW}$WORKSPACE_DIR${NC}"
+    echo -e "Container: ${YELLOW}$CONTAINER_WORKSPACE_DIR${NC}"
     echo -e "Config:    ${YELLOW}$CONFIG_DIR${NC}"
     echo ""
 
     # Run the container
     docker run --rm -it \
-        -v "$WORKSPACE_DIR:/workspace" \
+        --network host \
+        -v "$WORKSPACE_DIR:$CONTAINER_WORKSPACE_DIR" \
         -v "$CONFIG_DIR:/claude" \
+        -w "$CONTAINER_WORKSPACE_DIR" \
         -e "CLAUDE_CONFIG_DIR=/claude" \
+        -e "HTTP_PROXY=${HTTP_PROXY:-http://127.0.0.1:7890}" \
+        -e "HTTPS_PROXY=${HTTPS_PROXY:-http://127.0.0.1:7890}" \
+        -e "http_proxy=${http_proxy:-http://127.0.0.1:7890}" \
+        -e "https_proxy=${https_proxy:-http://127.0.0.1:7890}" \
+        -e "NO_PROXY=localhost,127.0.0.1,::1" \
+        -e "no_proxy=localhost,127.0.0.1,::1" \
         -e "USER_UID=$(id -u)" \
         -e "USER_GID=$(id -g)" \
         "$IMAGE" \
