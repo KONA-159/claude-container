@@ -1,185 +1,190 @@
 # WSL + Docker + Claude Code Container Setup
 
-This document records the setup used on `kona`'s WSL Ubuntu 24.04 machine, from a fresh WSL environment to a working Docker-based Claude Code workflow.
+This document records the current setup used on `kona`'s WSL Ubuntu 24.04 machine.
 
-The goal is to make the same setup reproducible on another Windows + WSL machine.
+Last updated: 2026-05-09.
 
-## Final Architecture
+The old setup routed WSL, apt, Docker, and containers through a Windows HTTP proxy on `127.0.0.1:7890`. That setup has been replaced. The current setup uses WSL NAT and lets the Windows host's Clash TUN virtual adapter route outbound traffic.
+
+## Current Architecture
 
 ```text
 Claude Code
   -> Docker container launched by claude-container
-  -> Docker host network
-  -> WSL Ubuntu
-  -> Windows host proxy at 127.0.0.1:7890
-  -> FlClash rule proxy
+  -> Docker default bridge network
+  -> Docker daemon in WSL Ubuntu
+  -> WSL NAT
+  -> Windows host
+  -> Clash TUN virtual adapter
   -> Internet
 ```
 
-Important result:
-
-- WSL shell traffic goes through the Windows proxy.
-- `apt` goes through the Windows proxy.
-- Docker daemon image pulls go through the Windows proxy.
-- Claude Code runs inside a Docker container.
-- Claude Code config is persisted outside the container.
-
-## Problems We Hit
-
-### 1. apt `NOSPLIT`
-
-`sudo apt update` failed with errors like:
+SSH access from outside the machine is handled separately:
 
 ```text
-Clearsigned file isn't valid, got 'NOSPLIT'
-The repository 'http://archive.ubuntu.com/ubuntu noble InRelease' is no longer signed.
+outside client
+  -> Windows host port 2222
+  -> WSL Ubuntu port 22
 ```
 
-This was not an Ubuntu repository problem. It meant WSL direct network access was receiving invalid content, likely due to network/proxy/DNS interference.
+Important results:
 
-Fix: route apt through the working Windows proxy.
-
-### 2. Docker source file malformed
-
-At one point Docker's apt source was written across multiple lines:
-
-```text
-deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg]
-  https://download.docker.com/linux/ubuntu noble stable
-```
-
-That produced:
-
-```text
-Malformed entry ... docker.list
-```
-
-Fix: remove the broken old-style file and use Docker's official `.sources` format.
-
-### 3. Windows proxy only listened on localhost
-
-Initially FlClash listened only on:
-
-```text
-127.0.0.1:7890
-```
-
-WSL could not reliably reach it. After enabling LAN access / binding to all interfaces, Windows showed:
-
-```powershell
-netstat -ano | findstr LISTENING | findstr :7890
-```
-
-Expected output:
-
-```text
-TCP    0.0.0.0:7890    0.0.0.0:0    LISTENING
-TCP    [::]:7890       [::]:0       LISTENING
-```
-
-### 4. Docker daemon did not inherit shell proxy
-
-Even when `curl` worked in WSL, Docker image pulls failed:
-
-```text
-failed to resolve reference "docker.io/library/hello-world:latest"
-dial tcp 157.240...:443: i/o timeout
-```
-
-Those IPs were clearly wrong for Docker Hub, indicating DNS/network pollution. The Docker daemon pulls images itself, so shell environment variables were not enough.
-
-Fix: configure the Docker systemd service with proxy environment variables.
-
-### 5. Containers could not use ordinary Docker bridge networking for proxy
-
-Inside containers:
-
-- Direct internet access timed out.
-- `host.docker.internal:7890` did not work.
-- `--network host` plus `127.0.0.1:7890` worked.
-
-Fix: patch the local `claude-container` wrapper to use `--network host` and pass proxy variables.
+- WSL is back in NAT mode.
+- Windows mirrored networking is disabled.
+- WSL does not export `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, or `https_proxy`.
+- `apt` does not use an explicit proxy config.
+- Docker daemon does not use an explicit proxy config.
+- Claude containers use Docker's default bridge network.
+- The `claude-container` wrapper does not inject proxy environment variables.
+- Claude Code config is persisted outside the temporary container.
 
 ## Windows Host Requirements
 
-Use a proxy client such as FlClash / Clash Verge Rev / Mihomo Party.
+Use Clash / Mihomo with TUN mode enabled on Windows.
 
-Required proxy settings:
+Recommended state:
 
 ```text
-Allow LAN: enabled
-Listen address / bind address: 0.0.0.0
-Mixed or HTTP port: 7890
-Mode: rule proxy is fine
+Clash TUN: enabled
+System traffic: routed through TUN
+WSL networking mode: NAT
+WSL mirrored networking: disabled
+WSL autoProxy: disabled
+WSL dnsTunneling: disabled
 ```
 
-Verify on Windows PowerShell:
+The current Windows user-level WSL config is:
+
+```ini
+[wsl2]
+  autoProxy=false
+  dnsTunneling=false
+```
+
+On this machine the file is:
+
+```text
+/mnt/c/Users/13988/.wslconfig
+```
+
+If `.wslconfig` is changed, restart WSL from Windows PowerShell:
 
 ```powershell
-netstat -ano | findstr LISTENING | findstr :7890
+wsl --shutdown
 ```
 
-Good:
+## SSH Access
+
+WSL's OpenSSH server listens on port `22`.
+
+Windows forwards external port `2222` to WSL port `22`.
+
+The WSL SSH daemon config should keep port `22`:
 
 ```text
-0.0.0.0:7890
-[::]:7890
+/etc/ssh/sshd_config
 ```
 
-Bad:
+Relevant line:
 
 ```text
-127.0.0.1:7890
+Port 22
 ```
 
-Also verify the proxy itself works on Windows:
+Do not use `http_proxy` for SSH. `http_proxy` is only for HTTP-compatible proxy clients and should not point at port `22`.
 
-```powershell
-curl.exe -v -x http://127.0.0.1:7890 https://registry-1.docker.io/v2/
+## GitHub SSH Access
+
+With Clash TUN and fake-ip routing, `github.com:22` can be routed to a Clash fake IP such as `198.18.x.x` and closed before SSH key exchange. GitHub provides an SSH-over-443 endpoint for this case.
+
+Configure `~/.ssh/config` so all normal GitHub SSH remotes use port `443` automatically:
+
+```sshconfig
+Host github.com
+  HostName ssh.github.com
+  Port 443
+  User git
+  IdentityFile ~/.ssh/id_ed25519_github
+  IdentitiesOnly yes
+  AddKeysToAgent yes
 ```
 
-Expected result includes:
-
-```text
-HTTP/1.1 200 Connection established
-HTTP/1.1 401 Unauthorized
-```
-
-`401 Unauthorized` is a good result for Docker Registry. It means the registry is reachable and asking for auth.
-
-## WSL Proxy Setup
-
-In this environment, WSL uses mirrored/shared networking, so WSL can use:
-
-```text
-127.0.0.1:7890
-```
-
-Test from WSL:
+Add the GitHub SSH-over-443 host key if it is not already present:
 
 ```bash
-curl -I --max-time 10 -x http://127.0.0.1:7890 https://registry-1.docker.io/v2/
+ssh-keygen -F '[ssh.github.com]:443' -f ~/.ssh/known_hosts || \
+  printf '%s\n' '[ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+```
+
+Verify:
+
+```bash
+ssh -T git@github.com
 ```
 
 Expected:
 
 ```text
-HTTP/1.1 200 Connection established
-HTTP/2 401
+Hi <user>! You've successfully authenticated, but GitHub does not provide shell access.
 ```
 
-Add this to `~/.bashrc`:
+After this, ordinary SSH remotes keep working without changing remote URLs:
 
 ```bash
-# Use the Windows host proxy from WSL. This works with WSL mirrored networking
-# when the Windows proxy client listens on 0.0.0.0:7890.
-export HTTP_PROXY="http://127.0.0.1:7890"
-export HTTPS_PROXY="$HTTP_PROXY"
-export http_proxy="$HTTP_PROXY"
-export https_proxy="$HTTPS_PROXY"
-export NO_PROXY="localhost,127.0.0.1,::1"
-export no_proxy="$NO_PROXY"
+git clone git@github.com:owner/repo.git
+git fetch
+git pull
+git push
+```
 
+HTTPS remotes already use port `443` and do not need this SSH config.
+
+## WSL System Setup
+
+`/etc/wsl.conf` should enable systemd and set the default user:
+
+```ini
+[boot]
+systemd=true
+
+[user]
+default=kona
+```
+
+After changing this file, restart WSL from Windows PowerShell:
+
+```powershell
+wsl --shutdown
+```
+
+## Shell Environment
+
+Do not set proxy variables in `~/.bashrc` for the normal TUN setup.
+
+These should be absent unless a specific tool needs a temporary proxy:
+
+```bash
+HTTP_PROXY
+HTTPS_PROXY
+ALL_PROXY
+NO_PROXY
+http_proxy
+https_proxy
+all_proxy
+no_proxy
+```
+
+Check:
+
+```bash
+printenv | rg -i '^(http|https|all|no)_proxy=|^(HTTP|HTTPS|ALL|NO)_PROXY=' || true
+```
+
+Expected: no output.
+
+The `.bashrc` still sets the local Claude image and PATH:
+
+```bash
 # Use the locally rebuilt Claude Code image. Rebuild it from
 # ~/claude-projects/claude-container when updating Claude Code.
 export CLAUDE_IMAGE="kona/claude-container:latest"
@@ -188,20 +193,6 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
     export PATH="$HOME/.local/bin:$PATH"
 fi
 ```
-
-Reload:
-
-```bash
-source ~/.bashrc
-```
-
-Avoid large `NO_PROXY` values such as:
-
-```text
-192.168.*,10.*,172.*
-```
-
-Those can make tools bypass the proxy unexpectedly.
 
 ## Install Docker Engine on WSL Ubuntu 24.04
 
@@ -246,22 +237,6 @@ sudo apt-get update
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 ```
 
-Make sure WSL uses systemd. `/etc/wsl.conf` should contain:
-
-```ini
-[boot]
-systemd=true
-
-[user]
-default=kona
-```
-
-From Windows PowerShell, restart WSL if needed:
-
-```powershell
-wsl --shutdown
-```
-
 Start Docker:
 
 ```bash
@@ -275,53 +250,56 @@ Add the user to the Docker group:
 sudo usermod -aG docker "$USER"
 ```
 
-Restart WSL once after this:
+Restart WSL once after changing group membership:
 
 ```powershell
 wsl --shutdown
 ```
 
-## Configure Docker Daemon Proxy
+## Docker Proxy State
 
-Docker daemon needs its own proxy config.
+Docker daemon should not have a proxy drop-in for this setup.
 
-Create:
+These old files should not exist in their active locations:
 
-```bash
-sudo mkdir -p /etc/systemd/system/docker.service.d
+```text
+/etc/systemd/system/docker.service.d/proxy.conf
+/etc/apt/apt.conf.d/95wsl-proxy
 ```
 
-Write `/etc/systemd/system/docker.service.d/proxy.conf`:
+If they exist, remove or archive them:
 
 ```bash
-sudo tee /etc/systemd/system/docker.service.d/proxy.conf > /dev/null <<'EOF'
-[Service]
-Environment="HTTP_PROXY=http://127.0.0.1:7890"
-Environment="HTTPS_PROXY=http://127.0.0.1:7890"
-Environment="NO_PROXY=localhost,127.0.0.1,::1"
-EOF
-```
+sudo mkdir -p ~/network-cleanup-backups
 
-Reload and restart:
+if [ -f /etc/apt/apt.conf.d/95wsl-proxy ]; then
+  sudo mv /etc/apt/apt.conf.d/95wsl-proxy ~/network-cleanup-backups/95wsl-proxy.disabled
+fi
 
-```bash
+if [ -f /etc/systemd/system/docker.service.d/proxy.conf ]; then
+  sudo mv /etc/systemd/system/docker.service.d/proxy.conf ~/network-cleanup-backups/docker-proxy.conf.disabled
+fi
+
+sudo chown -R "$USER:$USER" ~/network-cleanup-backups
 sudo systemctl daemon-reload
 sudo systemctl restart docker
 ```
 
-Verify:
+Verify Docker daemon has no proxy environment:
 
 ```bash
-sudo systemctl show --property=Environment docker
+systemctl show docker --property=Environment
+docker info --format '{{json .HTTPProxy}} {{json .HTTPSProxy}} {{json .NoProxy}}'
 ```
 
 Expected:
 
 ```text
-Environment=HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=http://127.0.0.1:7890 NO_PROXY=localhost,127.0.0.1,::1
+Environment=
+"" "" ""
 ```
 
-Verify Docker:
+Verify Docker can pull and run a container:
 
 ```bash
 docker run --rm hello-world
@@ -333,30 +311,23 @@ Expected:
 Hello from Docker!
 ```
 
-If group membership has not taken effect yet, use:
+## apt Proxy State
 
-```bash
-sudo docker run --rm hello-world
-```
-
-## Configure apt Proxy
-
-Create `/etc/apt/apt.conf.d/95wsl-proxy`:
-
-```bash
-sudo tee /etc/apt/apt.conf.d/95wsl-proxy > /dev/null <<'EOF'
-Acquire::http::Proxy "http://127.0.0.1:7890";
-Acquire::https::Proxy "http://127.0.0.1:7890";
-EOF
-```
+`apt` should not use an explicit proxy for this setup.
 
 Verify:
 
 ```bash
-sudo apt-get update
+apt-config dump | rg -i 'Acquire::.*Proxy|127\.0\.0\.1:7890' || true
 ```
 
-Expected: no `NOSPLIT`, no Docker TLS handshake errors.
+Expected: no output.
+
+Then verify package metadata can be refreshed:
+
+```bash
+sudo apt-get update
+```
 
 ## Install Claude Container
 
@@ -366,7 +337,7 @@ Project used:
 https://github.com/KONA-159/claude-container
 ```
 
-This is a fork of `nezhar/claude-container` with the local WSL adaptations already applied. It is a Docker-based launcher for Claude Code. It is not Claude Code itself. It is a wrapper around `docker run`.
+This is a fork of `nezhar/claude-container`. It is a Docker-based launcher for Claude Code. It is not Claude Code itself. It is a wrapper around `docker run`.
 
 Install the wrapper:
 
@@ -393,11 +364,11 @@ cd ~/claude-projects/claude-container
 docker build --pull --no-cache -t kona/claude-container:latest ./claude-code
 ```
 
-## WSL Adaptations Built Into This Fork
+## Claude Container Wrapper Behavior
 
-In this WSL setup, ordinary Docker bridge networking cannot reach the Windows proxy, so the forked launcher uses host networking in normal mode.
+The wrapper should not use host networking for normal mode. It should also not inject proxy variables.
 
-Also avoid mounting every project to the same container path, such as `/workspace`. Claude Code stores project state by absolute path. If every project appears as `/workspace`, resume history, trust state, and allowed tools can be mixed across unrelated projects.
+It still avoids mounting every project to the same container path. Claude Code stores project state by absolute path. If every project appears as `/workspace`, resume history, trust state, and allowed tools can be mixed across unrelated projects.
 
 This fork maps each host workspace to:
 
@@ -405,29 +376,30 @@ This fork maps each host workspace to:
 /workspaces/<host-project-directory-name>
 ```
 
-The relevant normal-mode `docker run` behavior is:
+The normal-mode `docker run` behavior should be:
 
 ```bash
 WORKSPACE_BASENAME="$(basename "$WORKSPACE_DIR")"
 CONTAINER_WORKSPACE_DIR="/workspaces/${WORKSPACE_BASENAME}"
 
 docker run --rm -it \
-    --network host \
     -v "$WORKSPACE_DIR:$CONTAINER_WORKSPACE_DIR" \
     -v "$CONFIG_DIR:/claude" \
     -w "$CONTAINER_WORKSPACE_DIR" \
     -e "CLAUDE_CONFIG_DIR=/claude" \
-    -e "HTTP_PROXY=${HTTP_PROXY:-http://127.0.0.1:7890}" \
-    -e "HTTPS_PROXY=${HTTPS_PROXY:-http://127.0.0.1:7890}" \
-    -e "http_proxy=${http_proxy:-http://127.0.0.1:7890}" \
-    -e "https_proxy=${https_proxy:-http://127.0.0.1:7890}" \
-    -e "NO_PROXY=localhost,127.0.0.1,::1" \
-    -e "no_proxy=localhost,127.0.0.1,::1" \
     -e "USER_UID=$(id -u)" \
     -e "USER_GID=$(id -g)" \
     "$IMAGE" \
     $COMMAND
 ```
+
+Verify the active wrapper has no old network settings:
+
+```bash
+rg -n '127\.0\.0\.1:7890|--network host|HTTP_PROXY|HTTPS_PROXY|http_proxy|https_proxy|NO_PROXY|no_proxy' ~/.local/bin/claude-container || true
+```
+
+Expected: no output.
 
 ## Verify Claude Container
 
@@ -437,7 +409,7 @@ Check versions:
 claude-container --version
 ```
 
-On this machine, it reported:
+On this machine, it currently reports:
 
 ```text
 Claude Container: v1.6.12
@@ -446,31 +418,13 @@ Docker: 29.4.3
 
 The wrapper version is not the same as Claude Code's real version.
 
-Check real Claude Code version inside the container:
-
-```bash
-claude-container claude --version
-```
-
-On this machine:
-
-```text
-2.1.133 (Claude Code)
-```
-
 Check environment passed into the container:
 
 ```bash
 claude-container env
 ```
 
-Expected proxy values:
-
-```text
-HTTP_PROXY=http://127.0.0.1:7890
-HTTPS_PROXY=http://127.0.0.1:7890
-NO_PROXY=localhost,127.0.0.1,::1
-```
+Expected: no proxy values such as `HTTP_PROXY=http://127.0.0.1:7890`.
 
 ## How to Use Claude Code
 
@@ -536,72 +490,11 @@ docker build --pull --no-cache -t kona/claude-container:latest ./claude-code
 claude-container claude --version
 ```
 
-Command breakdown:
-
-```text
-docker build
-```
-
-Builds a Docker image from a Dockerfile.
-
-```text
---pull
-```
-
-Before building, Docker tries to pull the latest base image. In this project the base image is:
-
-```dockerfile
-FROM node:22-alpine
-```
-
-```text
---no-cache
-```
-
-Forces Docker to rerun every build step instead of reusing cached layers. This matters because the Dockerfile installs `@anthropic-ai/claude-code@latest`; without `--no-cache`, Docker may reuse an old npm install layer.
-
-```text
--t kona/claude-container:latest
-```
-
-Tags the newly built image as:
-
-```text
-kona/claude-container:latest
-```
-
-This is the local image used by the launcher through:
-
-```bash
-export CLAUDE_IMAGE="kona/claude-container:latest"
-```
-
-```text
-./claude-code
-```
-
-Uses `./claude-code` as the build context. Docker reads:
-
-```text
-./claude-code/Dockerfile
-```
-
-and includes files from that directory, such as `entrypoint.sh`.
-
-The fork's `claude-code/Dockerfile` installs:
-
-```dockerfile
-ARG CLAUDE_CODE_VERSION=latest
-RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
-```
-
-Without a build arg, `latest` is resolved at image build time. For example, if npm's latest version is `2.1.133` when the image is built, this image will keep using `2.1.133` until it is rebuilt. It will not update automatically when npm publishes a newer release.
-
 To pin a specific version:
 
 ```bash
 docker build --pull --no-cache \
-  --build-arg CLAUDE_CODE_VERSION=2.1.133 \
+  --build-arg CLAUDE_CODE_VERSION=<version> \
   -t kona/claude-container:latest \
   ./claude-code
 ```
@@ -714,74 +607,6 @@ Current effective content, with secrets hidden:
 
 When recreating this setup on another machine, replace `<redacted>` with the real token if using OpenRouter.
 
-### `.claude.json`
-
-Current file path:
-
-```text
-~/.config/claude-container/config/.claude.json
-```
-
-This file is Claude Code's global state/config file in this containerized setup. The equivalent official bare-metal path is usually:
-
-```text
-~/.claude.json
-```
-
-Current content with identifiers, API metrics, and session values hidden:
-
-```json
-{
-  "numStartups": 1,
-  "tipsHistory": {
-    "new-user-warmup": "<redacted>",
-    "plan-mode-for-complex-tasks": 1
-  },
-  "hasCompletedOnboarding": true,
-  "firstStartTime": "2026-05-08T14:29:37.325Z",
-  "userID": "<redacted>",
-  "opusProMigrationComplete": true,
-  "sonnet1m45MigrationComplete": true,
-  "cachedChromeExtensionInstalled": false,
-  "changelogLastFetched": 1778250577946,
-  "projects": {
-    "/workspace": {
-      "allowedTools": [],
-      "mcpContextUris": [],
-      "mcpServers": {},
-      "enabledMcpjsonServers": [],
-      "disabledMcpjsonServers": [],
-      "hasTrustDialogAccepted": true,
-      "projectOnboardingSeenCount": 1,
-      "hasClaudeMdExternalIncludesApproved": false,
-      "hasClaudeMdExternalIncludesWarningShown": false,
-      "lastCost": 0,
-      "lastAPIDuration": "<redacted>",
-      "lastAPIDurationWithoutRetries": "<redacted>",
-      "lastToolDuration": 0,
-      "lastDuration": 9910,
-      "lastLinesAdded": 0,
-      "lastLinesRemoved": 0,
-      "lastTotalInputTokens": "<redacted>",
-      "lastTotalOutputTokens": "<redacted>",
-      "lastTotalCacheCreationInputTokens": "<redacted>",
-      "lastTotalCacheReadInputTokens": "<redacted>",
-      "lastTotalWebSearchRequests": 0,
-      "lastFpsAverage": 2.83,
-      "lastFpsLow1Pct": 23.31,
-      "lastModelUsage": {},
-      "lastSessionId": "<redacted>",
-      "lastSessionMetrics": "<redacted>"
-    }
-  },
-  "lastReleaseNotesSeen": "2.1.69",
-  "officialMarketplaceAutoInstallAttempted": true,
-  "officialMarketplaceAutoInstalled": true
-}
-```
-
-Note: this snapshot was created before the wrapper was changed to mount projects under `/workspaces/<project-directory-name>`. New sessions should appear under project-specific paths instead of all sharing `/workspace`.
-
 ## Project Switching Recommendation
 
 Do not start Claude from `/` or from a huge directory containing unrelated data.
@@ -806,53 +631,67 @@ Reason:
 - `.claude/settings.json`, hooks, MCP, and permission settings are most reliable when Claude starts in that project root.
 - `--add-dir` is useful for adding access to extra directories, but it should not be treated as full project-root switching.
 
-## Temporary sudo Access Used During Setup
+## Deprecated Old Proxy Setup
 
-During setup, passwordless sudo was enabled with:
+Do not restore the old setup unless Clash TUN is unavailable and you intentionally want a local HTTP proxy path.
 
-```bash
-sudo sh -c 'printf "%s\n" "kona ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/99-kona-codex && chmod 0440 /etc/sudoers.d/99-kona-codex && visudo -cf /etc/sudoers.d/99-kona-codex'
+Deprecated items:
+
+```text
+Windows HTTP proxy at 127.0.0.1:7890
+WSL mirrored networking for localhost proxy access
+~/.bashrc HTTP_PROXY/HTTPS_PROXY exports
+/etc/apt/apt.conf.d/95wsl-proxy
+/etc/systemd/system/docker.service.d/proxy.conf
+claude-container --network host
+claude-container proxy env injection
 ```
 
-After setup, remove it:
-
-```bash
-sudo rm -f /etc/sudoers.d/99-kona-codex
-```
+The old setup worked around DNS/proxy pollution before host-level TUN routing was fixed. With TUN enabled, explicit proxy configuration creates unnecessary failure points, especially because `127.0.0.1` inside WSL or inside a Docker container is not the Windows host proxy.
 
 ## Quick Health Checks
 
-Windows proxy:
-
-```powershell
-netstat -ano | findstr LISTENING | findstr :7890
-curl.exe -v -x http://127.0.0.1:7890 https://registry-1.docker.io/v2/
-```
-
-WSL proxy:
+WSL proxy variables:
 
 ```bash
-curl -I --max-time 10 https://registry-1.docker.io/v2/
+printenv | rg -i '^(http|https|all|no)_proxy=|^(HTTP|HTTPS|ALL|NO)_PROXY=' || true
 ```
+
+Expected: no output.
 
 apt:
 
 ```bash
+apt-config dump | rg -i 'Acquire::.*Proxy|127\.0\.0\.1:7890' || true
 sudo apt-get update
 ```
 
-Docker daemon proxy:
+Docker daemon:
 
 ```bash
-sudo systemctl show --property=Environment docker
+systemctl show docker --property=Environment
+docker info --format '{{json .HTTPProxy}} {{json .HTTPSProxy}} {{json .NoProxy}}'
 docker run --rm hello-world
 ```
 
-Claude container:
+Expected Docker proxy output:
+
+```text
+Environment=
+"" "" ""
+```
+
+Claude container wrapper:
 
 ```bash
-claude-container claude --version
-claude-container env
+rg -n '127\.0\.0\.1:7890|--network host|HTTP_PROXY|HTTPS_PROXY|http_proxy|https_proxy|NO_PROXY|no_proxy' ~/.local/bin/claude-container || true
+claude-container --version
+```
+
+GitHub SSH:
+
+```bash
+ssh -T git@github.com
 ```
 
 ## Known Good Versions on This Machine
@@ -863,6 +702,9 @@ Kernel: WSL2, 6.6.87.2-microsoft-standard-WSL2
 Docker Engine: 29.4.3
 Docker Compose: v5.1.3
 Claude Container wrapper/image: 1.6.12
-Claude Code inside local container image: 2.1.133
-Proxy port: 7890
+WSL network mode: NAT
+Windows traffic routing: Clash TUN
+SSH forwarding: Windows host port 2222 -> WSL port 22
+GitHub SSH: git@github.com remapped to ssh.github.com:443
+Explicit WSL/Docker/apt HTTP proxy: disabled
 ```

@@ -509,19 +509,13 @@ else
     echo -e "Config:    ${YELLOW}$CONFIG_DIR${NC}"
     echo ""
 
-    # Run the container
+    # Run the container. Networking is left at Docker's default bridge mode; the
+    # host's Clash TUN handles outbound routing for WSL NAT traffic.
     docker run --rm -it \
-        --network host \
         -v "$WORKSPACE_DIR:$CONTAINER_WORKSPACE_DIR" \
         -v "$CONFIG_DIR:/claude" \
         -w "$CONTAINER_WORKSPACE_DIR" \
         -e "CLAUDE_CONFIG_DIR=/claude" \
-        -e "HTTP_PROXY=${HTTP_PROXY:-http://127.0.0.1:7890}" \
-        -e "HTTPS_PROXY=${HTTPS_PROXY:-http://127.0.0.1:7890}" \
-        -e "http_proxy=${http_proxy:-http://127.0.0.1:7890}" \
-        -e "https_proxy=${https_proxy:-http://127.0.0.1:7890}" \
-        -e "NO_PROXY=localhost,127.0.0.1,::1" \
-        -e "no_proxy=localhost,127.0.0.1,::1" \
         -e "USER_UID=$(id -u)" \
         -e "USER_GID=$(id -g)" \
         "$IMAGE" \
